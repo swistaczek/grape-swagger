@@ -12,15 +12,17 @@ module Grape
         mount(documentation_class)
 
         @combined_routes = {}
+        
         routes.each do |route|
           route_match = route.route_path.split(route.route_prefix).last.match('\/([\w|-]*?)[\.\/\(]')
           next if route_match.nil?
           resource = route_match.captures.first
           next if resource.empty?
           resource.downcase!
+          
           @combined_routes[resource] ||= []
 
-          unless @@hide_documentation_path and route.route_path.include? @@mount_path
+          unless @@hide_documentation_path and route.route_path.include?(@@mount_path)
             @combined_routes[resource] << route
           end
         end
@@ -40,26 +42,25 @@ module Grape
 
           def self.setup(options)
             defaults = {
-              :models        => [],
-              :target_class  => nil,
-              :mount_path    => '/swagger_doc',
-              :base_path     => nil,
-              :api_version   => '0.1',
-              :markdown      => false,
-              :info          => { title: '', description: '', contact: '', 
-                                  license: '', licenseUrl: '', termsOfServiceUrl: ''},
-              :hide_format   => false,
-              :authorization => nil,
-              :root_base_path => true, 
-              :include_base_url => true,
-              :hide_documentation_path => false
+              :target_class             => nil,
+              :mount_path               => '/swagger_doc',
+              :base_path                => nil,
+              :api_version              => '0.1',
+              :markdown                 => false,
+              :hide_documentation_path  => false,
+              :hide_format              => false,
+              :models                   => [],
+              :info                     => {},
+              :authorizations           => nil,
+              :root_base_path           => true, 
+              :include_base_url         => true
             }
             
             options = defaults.merge(options)
 
             target_class     = options[:target_class]
             @@mount_path     = options[:mount_path]
-            @@class_name     = options[:class_name] || options[:mount_path].gsub('/','')
+            @@class_name     = options[:class_name] || options[:mount_path].gsub('/', '')
             @@markdown       = options[:markdown]
             @@hide_format    = options[:hide_format]
             api_version      = options[:api_version]
@@ -73,68 +74,86 @@ module Grape
 
             desc 'Swagger compatible API description'
             get @@mount_path do
-              header['Access-Control-Allow-Origin'] = '*'
+              header['Access-Control-Allow-Origin']   = '*'
               header['Access-Control-Request-Method'] = '*'
+              
               routes = target_class::combined_routes
 
               if @@hide_documentation_path
                 routes.reject!{ |route, value| "/#{route}/".index(parse_path(@@mount_path, nil) << '/') == 0 }
               end
 
-              routes_array = routes.keys.map { |local_route|
-                next if routes[local_route].all? { |route| route.route_hidden }
-                { :path => "#{include_base_url ? parse_path(route.route_path.gsub('(.:format)', ''),route.route_version) : ''}/#{local_route}#{@@hide_format ? '' : '.{format}'}" }
-              }.compact
+              routes_array = routes.keys.map do |local_route|
+                next if routes[local_route].all?(&:route_hidden)
+                
+                url_base    = parse_path(route.route_path.gsub('(.:format)', ''), route.route_version) if include_base_url
+                url_format  = '.{format}' unless @@hide_format
+                
+                {
+                  :path => "#{url_base}/#{local_route}#{url_format}",
+                  #:description => "..."
+                }
+              end.compact
 
               output = {
                 apiVersion:     api_version,
                 swaggerVersion: "1.2",
-                apis:           routes_array
+                produces:       content_types_for(target_class),
+                operations:     [],
+                apis:           routes_array,
+                info:           parse_info(extra_info)
               }
 
-              basePath = parse_base_path(base_path, request)
+              basePath                = parse_base_path(base_path, request)
               output[:basePath]       = basePath        if basePath && basePath.size > 0 && root_base_path != false
               output[:authorizations] = authorizations  if authorizations
-              output[:info]           = extra_info      if extra_info
 
               output
             end
 
-            desc 'Swagger compatible API description for specific API', :params =>
-              {
-                "name" => { :desc => "Resource name of mounted API", :type => "string", :required => true },
+            desc 'Swagger compatible API description for specific API', :params => {
+              "name" => {
+                :desc     => "Resource name of mounted API",
+                :type     => "string",
+                :required => true
               }
+            }
             get "#{@@mount_path}/:name" do
               header['Access-Control-Allow-Origin']   = '*'
               header['Access-Control-Request-Method'] = '*'
+              
               models = []
               routes = target_class::combined_routes[params[:name]]
-              routes_array = routes.map {|route|
-                next if route.route_hidden
-                notes = as_markdown(route.route_notes)
-                http_codes = parse_http_codes route.route_http_codes
+              
+              routes_array = routes.reject(&:route_hidden).map do |route|
+                notes       = as_markdown(route.route_notes)
+                http_codes  = parse_http_codes(route.route_http_codes)
+                
                 models << route.route_entity if route.route_entity
+                
                 operations = {
-                    :notes => notes,
-                    :summary => route.route_description || '',
-                    :nickname   => (route.route_nickname || (route.route_method + route.route_path.gsub(/[\/:\(\)\.]/,'-'))),
-                    :httpMethod => route.route_method,
-                    :parameters => parse_header_params(route.route_headers) +
-                      parse_params(route.route_params, route.route_path, route.route_method)
+                  :produces   => content_types_for(target_class),
+                  :notes      => notes.to_s,
+                  :summary    => route.route_description || '',
+                  :nickname   => route.route_nickname || (route.route_method + route.route_path.gsub(/[\/:\(\)\.]/,'-')),
+                  :httpMethod => route.route_method,
+                  :parameters => parse_header_params(route.route_headers) +
+                    parse_params(route.route_params, route.route_path, route.route_method)
                 }
-                operations.merge!({:type => route.route_entity.to_s.split('::')[-1]}) if route.route_entity
-                operations.merge!({:errorResponses => http_codes}) unless http_codes.empty?
+                operations.merge!(:type => route.route_entity.to_s.split('::')[-1]) if route.route_entity
+                operations.merge!(:responseMessages => http_codes) unless http_codes.empty?
+                
                 {
-                  :path => parse_path(route.route_path, api_version),
+                  :path       => parse_path(route.route_path, api_version),
                   :operations => [operations]
                 }
-              }.compact
+              end.compact
 
               api_description = {
-                apiVersion: api_version,
+                apiVersion:     api_version,
                 swaggerVersion: "1.2",
-                resourcePath: "",
-                apis: routes_array
+                resourcePath:   "",
+                apis:           routes_array
               }
 
               basePath                   = parse_base_path(base_path, request)
@@ -145,7 +164,6 @@ module Grape
             end
           end
 
-
           helpers do
 
             def as_markdown(description)
@@ -153,52 +171,72 @@ module Grape
             end
 
             def parse_params(params, path, method)
-              if params
-                params.map do |param, value|
-                  value[:type] = 'file' if value.is_a?(Hash) && value[:type] == 'Rack::Multipart::UploadedFile'
+              params ||= []
+              
+              params.map do |param, value|
+                value[:type] = 'file' if value.is_a?(Hash) && value[:type] == 'Rack::Multipart::UploadedFile'
 
-                  dataType = value.is_a?(Hash) ? (value[:type] || 'String').to_s : 'String'
-                  description = value.is_a?(Hash) ? value[:desc] || value[:description] : ''
-                  required = value.is_a?(Hash) ? !!value[:required] : false
-                  paramType = path.include?(":#{param}") ? 'path' : (method == 'POST') ? 'form' : 'query'
-                  name = (value.is_a?(Hash) && value[:full_name]) || param
-                  {
-                    paramType: paramType,
-                    name: name,
-                    description: as_markdown(description),
-                    dataType: dataType,
-                    required: required
-                  }
-                end
-              else
-                []
+                dataType    = value.is_a?(Hash) ? (value[:type] || 'String').to_s : 'String'
+                description = value.is_a?(Hash) ? value[:desc] || value[:description] : ''
+                required    = value.is_a?(Hash) ? !!value[:required] : false
+                paramType   = path.include?(":#{param}") ? 'path' : (method == 'POST') ? 'form' : 'query'
+                name        = (value.is_a?(Hash) && value[:full_name]) || param
+                
+                {
+                  paramType:    paramType,
+                  name:         name,
+                  description:  as_markdown(description),
+                  type:         dataType,
+                  required:     required
+                }
               end
             end
+            
+            def content_types_for(target_class)
+              content_types = (target_class.settings[:content_types] || {}).values
+              
+              if content_types.empty?
+                formats       = [target_class.settings[:format], target_class.settings[:default_format]].compact.uniq
+                formats       = Grape::Formatter::Base.formatters({}).keys if formats.empty?
+                content_types = Grape::ContentTypes::CONTENT_TYPES.select{|content_type, mime_type| formats.include? content_type}.values
+              end
+              
+              content_types.uniq
+            end
 
+            def parse_info(info)
+              {
+                contact:            info[:contact],
+                description:        info[:description],
+                license:            info[:license],
+                licenseUrl:         info[:license_url],
+                termsOfServiceUrl:  info[:terms_of_service_url],
+                title:              info[:title]
+              }.delete_if{|_, value| value.blank?}
+            end
 
             def parse_header_params(params)
-              if params
-                params.map do |param, value|
-                  dataType = 'String'
-                  description = value.is_a?(Hash) ? value[:description] : ''
-                  required = value.is_a?(Hash) ? !!value[:required] : false
-                  paramType = "header"
-                  {
-                    paramType: paramType,
-                    name: param,
-                    description: as_markdown(description),
-                    dataType: dataType,
-                    required: required
-                  }
-                end
-              else
-                []
+              params ||= []
+              
+              params.map do |param, value|
+                dataType    = 'String'
+                description = value.is_a?(Hash) ? value[:description] : ''
+                required    = value.is_a?(Hash) ? !!value[:required] : false
+                paramType   = "header"
+                
+                {
+                  paramType:    paramType,
+                  name:         param,
+                  description:  as_markdown(description),
+                  type:         dataType,
+                  required:     required
+                }
               end
             end
 
             def parse_path(path, version)
               # adapt format to swagger format
-              parsed_path = path.gsub '(.:format)', ( @@hide_format ? '' : '.{format}')
+              parsed_path = path.gsub('(.:format)', @@hide_format ? '' : '.{format}')
               # This is attempting to emulate the behavior of
               # Rack::Mount::Strexp. We cannot use Strexp directly because
               # all it does is generate regular expressions for parsing URLs.
@@ -211,29 +249,46 @@ module Grape
 
             def parse_entity_models(models)
               result = {}
+              
               models.each do |model|
-                name = model.to_s.split('::')[-1]
+                name        = model.to_s.split('::')[-1]
+                properties  = {}
+                
+                model.documentation.each do |property_name, property_info|
+                  properties[property_name] = property_info
+                  
+                  # rename Grape Entity's "desc" to "description"
+                  if property_description = property_info.delete(:desc)
+                    property_info[:description] = property_description
+                  end
+                end
+                
                 result[name] = {
-                  id: model.instance_variable_get(:@root) || name,
-                  name: model.instance_variable_get(:@root) || name,
-                  properties: model.documentation
+                  id:         model.instance_variable_get(:@root) || name,
+                  name:       model.instance_variable_get(:@root) || name,
+                  properties: properties
                 }
               end
+              
               result
             end
 
             def parse_http_codes codes
               codes ||= {}
-              codes.collect do |k, v|
-                { code: k, message: v }
+              codes.map do |k, v|
+                {
+                  code: k,
+                  message: v,
+                  #responseModel: ...
+                }
               end
             end
 
-            def try(*a, &b)
-              if a.empty? && block_given?
+            def try(*args, &block)
+              if args.empty? && block_given?
                 yield self
-              else
-                public_send(*a, &b) if respond_to?(a.first)
+              elsif respond_to?(args.first)
+                public_send(*args, &block)
               end
             end
 
